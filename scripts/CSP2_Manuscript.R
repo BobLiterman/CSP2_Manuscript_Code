@@ -17,6 +17,10 @@ library(emmeans)
 library(ggvenn)
 library(viridis)
 library(broom)
+library(ggdist)
+library(lme4)
+library(emmeans)
+library(lmerTest)
 
 # Functions
 getIQROutlier <- function(x, mult = 1.5) {
@@ -1420,4 +1424,188 @@ fig_s4 <- cowplot::plot_grid(ggplot(fig_s4_df %>% filter(Variable == "Reference_
     theme(axis.text.x = element_text(angle=90)) +
     scale_color_manual(values = c("CSP2" = "blue","CSP1" = "orange3")) +
     scale_fill_manual(values = c("CSP2" = "blue","CSP1" = "orange3")),nrow=2)
+
+##### 05: Manuscript Revision #####
+
+# Distance data
+revision_df <- coverage_distance_df %>%
+  filter(!Seq_1 %in% fail_contig_isolates & !Seq_2 %in% fail_contig_isolates)
+
+outlier_revision_df <- coverage_distance_df %>%
+  filter(Seq_1 %in% fail_contig_isolates | Seq_2 %in% fail_contig_isolates)
+
+# Choosing a reference based on the highest query coverage rates
+reference_querycov_df <- csp2_ref_screening_df %>%
+  group_by(Species,Analysis_ID,Reference_ID) %>%
+  summarize(Median = median(Query_Percent_Aligned),
+            SD = sd(Query_Percent_Aligned))
+
+querycov_refs <- reference_querycov_df %>% 
+  arrange(desc(Median),SD) %>%
+  group_by(Species,Analysis_ID) %>%
+  slice(1) %>%
+  ungroup() %>%
+  pull(Reference_ID)
+
+# Distances
+ncbi_csp2_revision_df <- revision_df %>%
+  filter(Reference_ID %in% querycov_refs) %>%
+  select(Species,Analysis_ID,Seq_1,Seq_2,Comparison,Distance_1 = 'CSP2', Distance_2 = 'NCBI') %>% 
+  distinct(Comparison,.keep_all = TRUE) %>%
+  mutate(Difference = Distance_2 - Distance_1) %>%
+  mutate(Method_Comparison = "NCBI_v_CSP2")
+
+cfsan_csp2_revision_df <- revision_df %>%
+  filter(Reference_ID %in% querycov_refs) %>%
+  select(Species,Analysis_ID,Seq_1,Seq_2,Comparison,Distance_1 = 'CSP2', Distance_2 = 'CFSAN') %>% 
+  distinct(Comparison,.keep_all = TRUE) %>%
+  mutate(Difference = Distance_2 - Distance_1) %>%
+  mutate(Method_Comparison = "CSP1_v_CSP2")
+
+ncbi_cfsan_revision_df <- revision_df %>%
+  distinct(Comparison,.keep_all = TRUE) %>%
+  select(Species,Analysis_ID,Seq_1,Seq_2,Comparison,Distance_1 = "CFSAN",Distance_2 = "NCBI") %>% 
+  mutate(Difference = Distance_2 - Distance_1) %>%
+  mutate(Method_Comparison = "NCBI_v_CSP1")
+
+# Outlier distances
+ncbi_csp2_outlier_revision_df <- outlier_revision_df %>%
+  filter(Reference_ID %in% querycov_refs) %>%
+  select(Species,Analysis_ID,Seq_1,Seq_2,Comparison,Distance_1 = 'CSP2', Distance_2 = 'NCBI') %>% 
+  distinct(Comparison,.keep_all = TRUE) %>%
+  mutate(Difference = Distance_2 - Distance_1) %>%
+  mutate(Method_Comparison = "NCBI_v_CSP2")
+
+cfsan_csp2_outlier_revision_df <- outlier_revision_df %>%
+  filter(Reference_ID %in% querycov_refs) %>%
+  select(Species,Analysis_ID,Seq_1,Seq_2,Comparison,Distance_1 = 'CSP2', Distance_2 = 'CFSAN') %>% 
+  distinct(Comparison,.keep_all = TRUE) %>%
+  mutate(Difference = Distance_2 - Distance_1) %>%
+  mutate(Method_Comparison = "CSP1_v_CSP2")
+
+ncbi_cfsan_outlier_revision_df <- outlier_revision_df %>%
+  distinct(Comparison,.keep_all = TRUE) %>%
+  select(Species,Analysis_ID,Seq_1,Seq_2,Comparison,Distance_1 = "CFSAN",Distance_2 = "NCBI") %>% 
+  mutate(Difference = Distance_2 - Distance_1) %>%
+  mutate(Method_Comparison = "NCBI_v_CSP1")
+
+
+# Slopes and correlations
+revision_stats_df <- bind_rows(ncbi_csp2_revision_df %>% select(-Difference),
+                           cfsan_csp2_revision_df %>% select(-Difference),
+                           ncbi_cfsan_revision_df %>% select(-Difference)) %>%
+  group_by(Species,Analysis_ID,Method_Comparison) %>%
+  summarize(Slope = lm(Distance_2 ~ Distance_1)$coefficients[2],
+            Intercept = lm(Distance_2 ~ Distance_1)$coefficients[1],
+            Correlation = cor(Distance_2,Distance_1))
+
+# Cluster-level stats
+revisions_cluster_stats <- bind_rows(ncbi_csp2_revision_df,cfsan_csp2_revision_df,ncbi_cfsan_revision_df) %>%
+  group_by(Species,Analysis_ID,Method_Comparison) %>%
+  reframe(Min = min(Difference),
+          Max = max(Difference),
+          Median = median(Difference,na.rm = TRUE),
+          Mean = mean(Difference,na.rm = TRUE),
+          SD = sd(Difference,na.rm = TRUE)) %>%
+  mutate(CI = map2_chr(Mean,SD,calculate_ci)) %>%
+  select(Species,Analysis_ID,Min,Max,Median,Mean,SD,CI,Method_Comparison) %>%
+  separate(CI,into = c("Lower_CI","Upper_CI"),sep=" - ",convert = TRUE) %>%
+  mutate(CI_Range = Upper_CI - Lower_CI)
+
+cluster_mean_order <- revisions_cluster_stats %>%
+  filter(Method_Comparison == "CSP1_v_CSP2") %>%
+  arrange(-abs(Mean)) %>%
+  pull(Analysis_ID)
+
+fig3_plot <- revisions_cluster_stats %>%
+  ggplot(aes(y = factor(Analysis_ID,levels=cluster_mean_order), x = Mean, color = Method_Comparison, fill = Method_Comparison,.groups=Method_Comparison)) +
+  geom_vline(xintercept = -3,linetype="dashed") +
+  geom_vline(xintercept = 3,linetype="dashed") +
+  geom_pointrange(alpha=0.75,aes(xmin = Lower_CI, xmax = Upper_CI),linewidth=1.5,position = position_dodge(width = 0.8)) +
+  geom_point(alpha=0.75,size = 3, shape = 21,color="black",position = position_dodge(width = 0.8)) +
+  facet_wrap(~Species, scales = "free",nrow=1) +
+  theme_bw() +
+  scale_color_manual(values = c("NCBI_v_CSP2" = "#70B9E4","CSP1_v_CSP2" = "#753EAF","NCBI_v_CSP1"="#D4930A")) +
+  scale_fill_manual(values = c("NCBI_v_CSP2" = "#70B9E4","CSP1_v_CSP2" = "#753EAF","NCBI_v_CSP1"="#D4930A")) +
+  theme(axis.title.x = element_blank(),
+        axis.text.y=element_blank(),
+        legend.position = "none",
+        axis.title.y = element_blank(),
+        strip.text=element_blank())
+
+# Isolate-level differences
+isolate_diff_df <- bind_rows(ncbi_csp2_revision_df,
+                             cfsan_csp2_revision_df,
+                             ncbi_cfsan_revision_df) %>%
+  select(Species,Analysis_ID,Sequence_ID = "Seq_1",Difference,Method_Comparison) %>%
+  bind_rows(bind_rows(ncbi_csp2_revision_df,
+            cfsan_csp2_revision_df,
+            ncbi_cfsan_revision_df) %>%
+  select(Species,Analysis_ID,Sequence_ID = "Seq_2",Difference,Method_Comparison)) %>%
+  group_by(Species,Analysis_ID,Sequence_ID,Method_Comparison) %>%
+  reframe(Mean = mean(Difference),
+            SD = sd(Difference),
+            Median = median(Difference)) %>%
+  mutate(CI = map2_chr(Mean,SD,calculate_ci)) %>%
+  separate(CI,into = c("Lower_CI","Upper_CI"),sep=" - ",convert = TRUE) %>%
+  mutate(Method_Comparison = factor(Method_Comparison,levels=c("CSP1_v_CSP2","NCBI_v_CSP2",'NCBI_v_CSP1')))
+
+species_diff_stats_df <- isolate_diff_df %>%
+  rename(Value = "Mean") %>%
+  group_by(Species,Method_Comparison) %>%
+  reframe(Median = median(Value,na.rm = TRUE),
+          Mean = mean(Value,na.rm = TRUE),
+          SD = sd(Value,na.rm = TRUE)) %>%
+  mutate(CI = map2_chr(Mean,SD,calculate_ci)) %>%
+  select(Species,Method_Comparison,Median,Mean,SD,CI) %>%
+  separate(CI,into = c("Lower_CI","Upper_CI"),sep=" - ",convert = TRUE) %>%
+  mutate(Method_Comparison = factor(Method_Comparison,levels=c("CSP1_v_CSP2","NCBI_v_CSP2",'NCBI_v_CSP1')))
+
+# Outlier differences
+outlier_isolate_diff_df <- bind_rows(ncbi_csp2_outlier_revision_df,
+                             cfsan_csp2_outlier_revision_df,
+                             ncbi_cfsan_outlier_revision_df) %>%
+  select(Species,Analysis_ID,Sequence_ID = "Seq_1",Difference,Method_Comparison) %>%
+  bind_rows(bind_rows(ncbi_csp2_outlier_revision_df,
+                      cfsan_csp2_outlier_revision_df,
+                      ncbi_cfsan_outlier_revision_df) %>%
+              select(Species,Analysis_ID,Sequence_ID = "Seq_2",Difference,Method_Comparison)) %>%
+  filter(Sequence_ID %in% fail_contig_isolates) %>%
+  group_by(Species,Analysis_ID,Sequence_ID,Method_Comparison) %>%
+  reframe(Mean = mean(Difference),
+          SD = sd(Difference),
+          Median = median(Difference)) %>%
+  mutate(CI = map2_chr(Mean,SD,calculate_ci)) %>%
+  separate(CI,into = c("Lower_CI","Upper_CI"),sep=" - ",convert = TRUE) %>%
+  mutate(Method_Comparison = factor(Method_Comparison,levels=c("CSP1_v_CSP2","NCBI_v_CSP2",'NCBI_v_CSP1')))
+
+outlier_species_diff_stats_df <- outlier_isolate_diff_df %>%
+  rename(Value = "Mean") %>%
+  group_by(Species,Method_Comparison) %>%
+  reframe(Median = median(Value,na.rm = TRUE),
+          Mean = mean(Value,na.rm = TRUE),
+          SD = sd(Value,na.rm = TRUE)) %>%
+  mutate(CI = map2_chr(Mean,SD,calculate_ci)) %>%
+  select(Species,Method_Comparison,Median,Mean,SD,CI) %>%
+  separate(CI,into = c("Lower_CI","Upper_CI"),sep=" - ",convert = TRUE) %>%
+  mutate(Method_Comparison = factor(Method_Comparison,levels=c("CSP1_v_CSP2","NCBI_v_CSP2",'NCBI_v_CSP1')))
+
+full_species_diff_stats_df <- bind_rows(species_diff_stats_df %>% mutate(Type = "Inlier"),outlier_species_diff_stats_df %>% mutate(Type = "Outlier")) %>%
+  mutate(CI_Range = Upper_CI - Lower_CI)
+
+isolate_plot_df <- bind_rows(isolate_diff_df %>% mutate(Type = "Inlier"),
+                             outlier_isolate_diff_df %>% mutate(Type = "Outlier"))
+
+fig4_plot <- ggplot(isolate_plot_df ,aes(x=Type,y=Mean,color=Method_Comparison,fill=Method_Comparison)) +
+  geom_hline(yintercept = 3,linetype="dashed") +
+  geom_hline(yintercept = -3,linetype="dashed") +
+  geom_boxplot(alpha = 0.5) + 
+  facet_wrap(~Species,nrow=1) +
+  theme_bw() +
+  scale_color_manual(values = c("NCBI_v_CSP2" = "#70B9E4","CSP1_v_CSP2" = "#753EAF","NCBI_v_CSP1"="#D4930A")) +
+  scale_fill_manual(values = c("NCBI_v_CSP2" = "#70B9E4","CSP1_v_CSP2" = "#753EAF","NCBI_v_CSP1"="#D4930A")) +
+  theme(legend.position = "none") +
+  theme(strip.text = element_blank()) +
+  ylab("Isolate Mean Difference")
+
   
